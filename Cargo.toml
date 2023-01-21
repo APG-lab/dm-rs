@@ -1,0 +1,18 @@
+[package]
+name = "dm"
+version = "0.0.1"
+rust-version = "1.66.1"
+edition = "2021"
+
+[[bin]]
+name = "dm"
+path = "src/main/rust/main.rs"
+
+[dependencies]
+clap = { version = "4.1", features = ["derive"]}
+crossbeam-channel = "0.5"
+env_logger = "0.9"
+flate2 = "1"
+log = "0.4"
+thiserror = "1.0"
+tokio = { version = "1.0", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "fs"] }
