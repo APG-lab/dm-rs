@@ -289,21 +289,21 @@ fn main () {
                     reads_in.fetch_add (25_000, sync::atomic::Ordering::Relaxed);
                 }
                 // find indices
-                if let Some (eofl) = fastq_record.record.find ("\n")
+                if let Some (eol) = fastq_record.record.find ("\n")
                 {
-                    //debug! ("found eofl: {}", eofl);
-                    if let Some (solocs) = fastq_record.record[0..eofl].rfind (":")
+                    //debug! ("found eol: {}", eol);
+                    if let Some (solocs) = fastq_record.record[0..eol].rfind (":")
                     {
-                        if let Some (sind) = fastq_record.record[solocs..eofl].find ("+")
+                        if let Some (sind) = fastq_record.record[solocs..eol].find ("+")
                         {
-                            if let (Some (_inda), Some (_indb)) = ( fastq_record.record.get ((solocs+1)..(solocs+sind)), fastq_record.record.get ((solocs+1+sind)..eofl) )
+                            if let (Some (_inda), Some (_indb)) = ( fastq_record.record.get ((solocs+1)..(solocs+sind)), fastq_record.record.get ((solocs+1+sind)..eol) )
                             {
                                 //debug! ("inda: {}", &fastq_record.record[solocs..(solocs+sind)]);
-                                //debug! ("inda: {} indb: {}", inda, indb);
+                                //debug! ("inda: {} indb: {}", _inda, _indb);
                                 fastq_record.start_p7 = solocs+1;
                                 fastq_record.start_p5 = solocs+1+sind;
                                 fastq_record.end_p7 = solocs+sind;
-                                fastq_record.end_p5 = eofl;
+                                fastq_record.end_p5 = eol;
                             }
                             else
                             {

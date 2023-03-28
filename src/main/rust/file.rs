@@ -1,7 +1,7 @@
 
 use crate::dm;
 use crate::helper;
-use flate2::read::GzDecoder;
+use flate2::read::MultiGzDecoder;
 //use log::debug;
 use std::io;
 use std::fs;
@@ -33,7 +33,7 @@ pub fn read_fastq<F> (records_read: &mut usize, fastq_file_path: String, mut pro
         F: FnMut (&str, &usize, &mut usize, &mut dm::FastqRecord) -> bool
 {
 
-    let mut reader = io::BufReader::new (GzDecoder::new (fs::File::open (fastq_file_path)?));
+    let mut reader = io::BufReader::new (MultiGzDecoder::new (fs::File::open (fastq_file_path)?));
     let mut buffer = String::new ();
     let mut line_count: usize = 0;
     let mut fastq_record = dm::FastqRecord::new ();
