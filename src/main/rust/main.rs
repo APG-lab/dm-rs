@@ -37,7 +37,10 @@ struct Cli
     output_dir_path: String,
 
     #[arg(long, help = "Output name pattern. %sample% will be substituted. Should end in '.fastq.gz'", default_value="%sample%.fastq.gz")]
-    output_name_pattern: String
+    output_name_pattern: String,
+
+    #[arg(long, help = "Lanes")]
+    number_of_lanes: Option<usize>
 }
 
 fn main () {
@@ -52,7 +55,6 @@ fn main () {
     let progress_ms = 10_000;
     let chan_bound = 100_000;
 
-    debug! ("hello");
     let args = Cli::parse ();
 
     //debug! ("args: {:?}",args);
@@ -80,32 +82,58 @@ fn main () {
          * crossbeam_channel and clone the receiver to keep it alive, but better to move
          * this to a blocking thread before the program exits?
          */
-        let (tx_stats, mut rx_stats) = tokio::sync::mpsc::unbounded_channel::<((String, String), usize, usize)> ();
+        let (tx_stats, mut rx_stats) = tokio::sync::mpsc::unbounded_channel::<((String, String, String), usize, usize)> ();
         let (tx_worker, rx_worker) = crossbeam_channel::bounded::<dm::FastqRecord> (args.n_threads);
 
         // create dm channels
-        let (mut tx_sample_data_dm, mut rx_sample_data_dm) = sample_data.iter ().enumerate ().fold ( ( Vec::new (), Vec:: new () ), |mut acc, (i, item)| {
-            let (tx_sample, rx_sample) = tokio::sync::mpsc::channel::<dm::FastqRecord> (chan_bound);
-            let output_name_resolved = args.output_name_pattern.replace ("%sample%", &item[0]);
-            let output_file_path = format! ("{}/{}", args.output_dir_path, output_name_resolved);
-            let output_file = GzEncoder::new (fs::File::create (output_file_path.clone ()).expect (&format! ("Unable to create file {}", output_file_path.clone ())), Compression::default ());
-            acc.0.push ( ( item, tx_sample ) );
-            acc.1.push ( ( rx_sample, output_file, i, output_file_path) );
+        let (_, mut tx_sample_data_dm, mut rx_sample_data_dm) = sample_data.iter ().fold ( ( 0,  Vec::new (), Vec:: new () ), |mut acc, item| {
+            //let (tx_sample, rx_sample) = tokio::sync::mpsc::channel::<dm::FastqRecord> (chan_bound)
+            if let Some (number_of_lanes) = args.number_of_lanes
+            {
+                for l in 1..number_of_lanes+1
+                {
+                    let lane = format! ("L{:0>3}", l);
+                    let (tx_sample, rx_sample) = tokio::sync::mpsc::channel::<dm::FastqRecord> (chan_bound);
+                    let output_name_resolved = args.output_name_pattern.replace ("%sample%", &item[0]).replace ("%lane%", &lane);
+                    let output_file_path = format! ("{}/{}", args.output_dir_path, output_name_resolved);
+                    let output_file = GzEncoder::new (fs::File::create (output_file_path.clone ()).expect (&format! ("Unable to create file {}", output_file_path.clone ())), Compression::default ());
+                    let mut iteml = vec![acc.0.to_string (), lane];
+                    iteml.extend (item.iter ().cloned ());
+                    acc.1.push ( ( iteml, tx_sample ) );
+                    acc.2.push ( ( rx_sample, output_file, acc.0, output_file_path) );
+                    acc.0 += 1;
+                }
+            }
+            else
+            {
+
+                let (tx_sample, rx_sample) = tokio::sync::mpsc::channel::<dm::FastqRecord> (chan_bound);
+                let output_name_resolved = args.output_name_pattern.replace ("%sample%", &item[0]);
+                let output_file_path = format! ("{}/{}", args.output_dir_path, output_name_resolved);
+                let output_file = GzEncoder::new (fs::File::create (output_file_path.clone ()).expect (&format! ("Unable to create file {}", output_file_path.clone ())), Compression::default ());
+
+                let mut iteml = vec![acc.0.to_string (), String::from ("L000")];
+                //i += 1;
+                iteml.extend (item.iter ().cloned ());
+                acc.1.push ( ( iteml, tx_sample ) );
+                acc.2.push ( ( rx_sample, output_file, acc.0, output_file_path) );
+                acc.0 += 1;
+            }
             acc
         });
         // Ensure our index pairs are sorted so we can use binary search
-        tx_sample_data_dm.sort_by (|a, b| (&a.0[1], &a.0[2]).partial_cmp ( &( &b.0[1], &b.0[2] ) ).unwrap());
+        tx_sample_data_dm.sort_by (|a, b| ( &a.0[1], &a.0[2], &a.0[3] ).partial_cmp ( &( &b.0[1], &b.0[2], &b.0[3] ) ).unwrap ());
 
         for (i, (item, _) ) in tx_sample_data_dm.iter ().enumerate ()
         {
-            debug! ("{:04} {}+{}", i,  item[1], item[2]);
+            debug! ("{:04} {} {} {}+{}", i,  item[1], item[2], item[3], item[4]);
         }
 
         // spawn workers
         for i in 1..args.n_threads
         {
             let mut index_lookup = tx_sample_data_dm.iter ().fold ( ( Vec::new (), Vec::new (), Vec::new (), Vec::new () ), |mut acc, item| {
-                acc.0.push ( ( item.0[1].clone (), item.0[2].clone () ) );
+                acc.0.push ( ( item.0[1].clone (), item.0[3].clone (), item.0[4].clone () ) );
                 acc.1.push ( item.1.clone () );
                 acc.2.push ( 0 );
                 acc.3.push ( 0 );
@@ -138,7 +166,19 @@ fn main () {
                             worker_dbg_reads_proc.fetch_add (1,sync::atomic::Ordering::Relaxed);
                             if let ( Some (inda), Some (indb) ) = ( &msg.record.get (msg.start_p7..msg.end_p7), &msg.record.get (msg.start_p5..msg.end_p5) )
                             {
-                                match index_lookup.0.binary_search ( &(inda.to_string (), indb.to_string ()) )
+                                let msg_lane = if let Some (lane_number) = msg.lane
+                                {
+                                    format! ("L{:0>3}", lane_number)
+                                }
+                                else if args.number_of_lanes.is_none ()
+                                {
+                                    String::from ("L000")
+                                }
+                                else
+                                {
+                                    panic! ("You supplied 'number of lanes' but no lane found for {:?}", msg.record);
+                                };
+                                match index_lookup.0.binary_search ( &( msg_lane.clone (), inda.to_string (), indb.to_string ()) )
                                 {
                                     Ok (sample_index) => {
                                         match index_lookup.1[sample_index].blocking_send (msg)
@@ -155,9 +195,9 @@ fn main () {
                                         if args.n_mismatches > 0
                                         {
                                             // attempt to find with 1 mismatch
-                                            for (sample_index, (sinda, sindb) ) in index_lookup.0.iter ().enumerate ()
+                                            for (sample_index, (index_lane, sinda, sindb) ) in index_lookup.0.iter ().enumerate ()
                                             {
-                                                if iter::zip (sinda.chars (), inda.chars ()).filter (|(x,y)| x != y).count () <= args.n_mismatches && iter::zip (sindb.chars (), indb.chars ()).filter (|(x,y)| x != y).count () <= args.n_mismatches
+                                                if &msg_lane == index_lane && iter::zip (sinda.chars (), inda.chars ()).filter (|(x,y)| x != y).count () <= args.n_mismatches && iter::zip (sindb.chars (), indb.chars ()).filter (|(x,y)| x != y).count () <= args.n_mismatches
                                                 {
                                                     match index_lookup.1[sample_index].blocking_send (msg)
                                                     {
@@ -188,10 +228,10 @@ fn main () {
                     drop (sndr);
                 }
                 debug! ("worker {} shutdown", i);
-                for ( (inda, indb), (n_perfect, n_mm) ) in iter::zip (index_lookup.0, iter::zip (index_lookup.2, index_lookup.3))
+                for ( (lane, inda, indb), (n_perfect, n_mm) ) in iter::zip (index_lookup.0, iter::zip (index_lookup.2, index_lookup.3))
                 {
                     //println! ("{}\t{}\t{}\t{}\t{}\t{}", sample_name, inda, indb, n_perfect, n_mm, n_perfect + n_mm);
-                    match worker_tx_stats.send ( ( (inda, indb), n_perfect, n_mm) )
+                    match worker_tx_stats.send ( ( (lane, inda, indb), n_perfect, n_mm) )
                     {
                         Ok (_) => {},
                         Err (e) => {
@@ -304,6 +344,19 @@ fn main () {
                                 fastq_record.start_p5 = solocs+1+sind;
                                 fastq_record.end_p7 = solocs+sind;
                                 fastq_record.end_p5 = eol;
+
+                                // find the lane
+                                let lpbi = fastq_record.record[0..eol].match_indices (':').collect::<Vec<_>> ();
+                                //debug! ("mi: {:?}", fastq_record.record[0..eol].match_indices (':').collect::<Vec<_>> ());
+                                //debug! ("mi: {:?}", &lpbi[2..4]);
+                                //debug! ("mi 1: {:?}", &lpbi[2..4][0].0);
+                                //debug! ("mi 2: {:?}", &lpbi[2..4][1].0);
+                                let soln = &lpbi[2..4][0].0 + 1;
+                                let eoln = *&lpbi[2..4][1].0;
+
+                                //debug! ("mi final: {:?}", &fastq_record.record[soln..eoln]);
+
+                                fastq_record.lane = Some (fastq_record.record[soln..eoln].parse::<usize> ().expect (&format! ("Faild to parse lane from {}", &fastq_record.record[soln..eoln])));
                             }
                             else
                             {
@@ -352,23 +405,41 @@ fn main () {
         drop (shutdown_send);
         debug! ("gather stats");
         rt.spawn_blocking (move || {
-            let mut stats = collections::HashMap::<(String,String), (usize,usize)>::new (); 
-            while let Some ( (inds, n_perfect, n_mm ) ) = rx_stats.blocking_recv ()
+            let mut stats = collections::HashMap::<(String,String,String), (usize,usize)>::new ();
+            while let Some ( (lane_and_inds, n_perfect, n_mm ) ) = rx_stats.blocking_recv ()
             {
-                let stat = stats.entry (inds).or_insert ( ( 0, 0) );
+                let stat = stats.entry (lane_and_inds).or_insert ( ( 0, 0) );
                 stat.0 += n_perfect;
                 stat.1 += n_mm;
             }
             //debug! ("stats: {:?}", stats);
             for (i, item) in sample_data.iter ().enumerate ()
             {
-                if let Some (stat) = stats.get ( &(item[1].clone (), item[2].clone ()) )
+                if let Some (number_of_lanes) = args.number_of_lanes
                 {
-                    println! ("{:04}\t{}\t{}\t{}\t{}\t{}\t{}", i, item[0], item[1], item[2], stat.0, stat.1, stat.0 + stat.1);
+                    for l in 1..number_of_lanes+1
+                    {
+                        let lane = format! ("L{:0>3}", l);
+                        if let Some (stat) = stats.get ( &(lane.clone (), item[1].clone (), item[2].clone ()) )
+                        {
+                            println! ("{:04}\t{}\t{}\t{}\t{}\t{}\t{}\t{}", i, lane, item[0], item[1], item[2], stat.0, stat.1, stat.0 + stat.1);
+                        }
+                        else
+                        {
+                            println! ("{:04}\t{}\t{}\t{}\t{}\t?\t?\t?", i, lane, item[0], item[1], item[2]);
+                        }
+                    }
                 }
                 else
                 {
-                    println! ("{:04}\t{}\t{}\t{}\t?\t?\t?", i, item[0], item[1], item[2]);
+                    if let Some (stat) = stats.get ( &( String::from ("L000"), item[1].clone (), item[2].clone ()) )
+                    {
+                        println! ("{:04}\t{}\t{}\t{}\t{}\t{}\t{}", i, item[0], item[1], item[2], stat.0, stat.1, stat.0 + stat.1);
+                    }
+                    else
+                    {
+                        println! ("{:04}\t{}\t{}\t{}\t?\t?\t?", i, item[0], item[1], item[2]);
+                    }
                 }
             }
         });
