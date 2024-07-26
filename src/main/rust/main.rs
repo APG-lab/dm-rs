@@ -99,7 +99,7 @@ fn main () {
                     let output_file = GzEncoder::new (fs::File::create (output_file_path.clone ()).expect (&format! ("Unable to create file {}", output_file_path.clone ())), Compression::default ());
                     let mut iteml = vec![acc.0.to_string (), lane];
                     iteml.extend (item.iter ().cloned ());
-                    acc.1.push ( ( iteml, tx_sample ) );
+                    acc.1.push ( ( iteml, Some (tx_sample) ) );
                     acc.2.push ( ( rx_sample, output_file, acc.0, output_file_path) );
                     acc.0 += 1;
                 }
@@ -115,7 +115,7 @@ fn main () {
                 let mut iteml = vec![acc.0.to_string (), String::from ("L000")];
                 //i += 1;
                 iteml.extend (item.iter ().cloned ());
-                acc.1.push ( ( iteml, tx_sample ) );
+                acc.1.push ( ( iteml, Some (tx_sample) ) );
                 acc.2.push ( ( rx_sample, output_file, acc.0, output_file_path) );
                 acc.0 += 1;
             }
@@ -166,22 +166,33 @@ fn main () {
                             worker_dbg_reads_proc.fetch_add (1,sync::atomic::Ordering::Relaxed);
                             if let ( Some (inda), Some (indb) ) = ( &msg.record.get (msg.start_p7..msg.end_p7), &msg.record.get (msg.start_p5..msg.end_p5) )
                             {
-                                let msg_lane = if let Some (lane_number) = msg.lane
+                                let msg_lane = if let Some (number_of_lanes) = args.number_of_lanes
                                 {
-                                    format! ("L{:0>3}", lane_number)
-                                }
-                                else if args.number_of_lanes.is_none ()
-                                {
-                                    String::from ("L000")
+                                    if let Some (lane_number) = msg.lane
+                                    {
+                                        if lane_number > number_of_lanes
+                                        {
+                                            panic! ("You supplied '{}' as 'number of lanes' but lane number '{}' is outside this range", number_of_lanes, lane_number);
+                                        }
+                                        else
+                                        {
+                                            format! ("L{:0>3}", lane_number)
+                                        }
+                                    }
+                                    else
+                                    {
+                                        panic! ("You supplied 'number of lanes' but no lane found for {:?}", msg.record);
+                                    }
                                 }
                                 else
                                 {
-                                    panic! ("You supplied 'number of lanes' but no lane found for {:?}", msg.record);
+                                    String::from ("L000")
                                 };
+
                                 match index_lookup.0.binary_search ( &( msg_lane.clone (), inda.to_string (), indb.to_string ()) )
                                 {
                                     Ok (sample_index) => {
-                                        match index_lookup.1[sample_index].blocking_send (msg)
+                                        match index_lookup.1[sample_index].as_ref ().expect ("Sender destroyed").blocking_send (msg)
                                         {
                                             Ok (_) => {
                                                 index_lookup.2[sample_index] += 1;
@@ -199,7 +210,7 @@ fn main () {
                                             {
                                                 if &msg_lane == index_lane && iter::zip (sinda.chars (), inda.chars ()).filter (|(x,y)| x != y).count () <= args.n_mismatches && iter::zip (sindb.chars (), indb.chars ()).filter (|(x,y)| x != y).count () <= args.n_mismatches
                                                 {
-                                                    match index_lookup.1[sample_index].blocking_send (msg)
+                                                    match index_lookup.1[sample_index].as_ref ().expect ("Sender destroyed").blocking_send (msg)
                                                     {
                                                         Ok (_) => {
                                                             index_lookup.3[sample_index] += 1;
@@ -223,10 +234,12 @@ fn main () {
                     }
                 }
                 drop (worker_rx_worker);
-                for sndr in index_lookup.1.iter_mut ()
+
+                for maybe_sndr in index_lookup.1.iter_mut ()
                 {
-                    drop (sndr);
+                    maybe_sndr.take ();
                 }
+
                 debug! ("worker {} shutdown", i);
                 for ( (lane, inda, indb), (n_perfect, n_mm) ) in iter::zip (index_lookup.0, iter::zip (index_lookup.2, index_lookup.3))
                 {
@@ -246,7 +259,7 @@ fn main () {
         // We need to drop the original senders
         for (_, sndr) in tx_sample_data_dm.iter_mut ()
         {
-            drop (sndr);
+            sndr.take ();
         }
         debug! ("dropped original tx_sample senders");
 
@@ -382,7 +395,7 @@ fn main () {
                 {
                     Ok (_) => {},
                     Err (e) => {
-                        debug! ("Failed to send fastq_record: {:?}", e);
+                        debug! ("Failed to send fastq_record: {:?} reason: {}", e, e.to_string ());
                         return false;
                     }
                 }
@@ -395,6 +408,7 @@ fn main () {
         let mut records_read = 0;
         for fastq_file_path in args.fastq_split_file_path
         {
+            debug! ("fastq_file_path: '{}'", fastq_file_path);
             if !file::read_fastq (&mut records_read, fastq_file_path, process_fastq_line).expect ("File was not read properly")
             {
                 debug! ("aborting fastq file reading");
